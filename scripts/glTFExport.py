@@ -6,6 +6,7 @@ import base64
 import math
 import shutil
 import time
+import logging
 
 import maya.cmds
 import maya.OpenMaya as OpenMaya
@@ -13,6 +14,10 @@ try:
     from PySide.QtGui import QImage, QColor, qRed, qGreen, qBlue, QImageWriter
 except ImportError:
     from PySide2.QtGui import QImage, QColor, qRed, qGreen, qBlue, QImageWriter
+
+
+# Logger
+logger = logging.getLogger(__name__)
 
 # TODO don't export hidden nodes?
 
@@ -56,23 +61,26 @@ def classproperty(func):
     if not isinstance(func, (classmethod, staticmethod)):
         func = classmethod(func)
     return ClassPropertyDescriptor(func)
-        
+
+# TODO: Add selection as option.
 class ExportSettings(object):
     file_format = 'gltf'
     resource_format = 'bin'
     anim = 'keyed'
-    vflip=True
+    vflip = True
     out_file = ''
     _out_dir = ''
     _out_basename = ''
+    selection = True
     
     @classmethod
     def set_defaults(cls):
         cls.file_format = 'glb'
         cls.resource_format = 'bin'
         cls.anim = 'keyed'
-        cls.vflip=True
+        cls.vflip = True
         cls.out_file = ''
+        cls.selection = True
     
     @classproperty
     def out_bin(cls):
@@ -92,7 +100,7 @@ class ExportSettings(object):
     
 class GLTFExporter(object):
     # TODO: Add VFlip option
-    def __init__(self, file_path, resource_format='bin', anim='keyed', vflip=True):
+    def __init__(self, file_path, resource_format='bin', anim='keyed', vflip=True, selection=False):
         self.output = {
             "asset": { 
                 "version": "2.0", 
@@ -116,11 +124,12 @@ class GLTFExporter(object):
         ExportSettings.resource_format = resource_format
         ExportSettings.anim = anim
         ExportSettings.vflip = vflip
+        ExportSettings.selection = selection
         
     def run(self):
         if not ExportSettings.out_file:
-            ExportSettings.out_file = maya.cmds.fileDialog2(caption="Specify a name for the file to export.",
-                                                        fileMode=0)[0]
+            ExportSettings.out_file = maya.cmds.fileDialog2(caption="Specify a name for the file to export.", fileMode=0)[0]
+    
         basename, ext = os.path.splitext(ExportSettings.out_file)
         if not ext in ['.glb', '.gltf']:
             raise Exception("Output file must have gltf or glb extension.")
@@ -128,9 +137,15 @@ class GLTFExporter(object):
         
         if not os.path.exists(ExportSettings.out_dir):
             os.makedirs(ExportSettings.out_dir)
+
+        selected_nodes = None
+
+        if ExportSettings.selection:
+            selected_nodes = maya.cmds.ls(selection=True, long=True)
+            logger.info("Selected Nodes: {}".format(selected_nodes))
         
         # TODO: validate file_path and type
-        scene = Scene()
+        scene = Scene(maya_nodes=selected_nodes)
         # we only support exporting single scenes, 
         # so the first scene is the active scene
         self.output['scene'] = 0
@@ -199,8 +214,17 @@ class GLTFExporter(object):
                 with open(ExportSettings.out_dir + "/" + buffer.uri, 'wb') as outfile:
                     outfile.write(buffer.byte_str)
         
-def export(file_path=None, resource_format='bin', anim='keyed', vflip=True, selection=False):
-    GLTFExporter(file_path, resource_format, anim, vflip).run()
+def export(file_path=None, resource_format='bin', anim='keyed', vflip=True, selection=True): # temporary
+    """Export file to specified format
+
+    Args:
+        file_path (string, optional): output path. Defaults to None.
+        resource_format (str, optional): flag for format. Defaults to 'bin'.
+        anim (str, optional): animated or static. Defaults to 'keyed'.
+        vflip (bool, optional): invert uv axis. Defaults to True.
+        selection (bool, optional): export only selected. Defaults to False. Unuse by now.
+    """
+    GLTFExporter(file_path, resource_format, anim, vflip, selection).run()
     
         
 class GLTFEncoder(json.JSONEncoder):
@@ -227,15 +251,19 @@ class Scene(ExportItem):
     def __init__(self, name="defaultScene", maya_nodes=None):
         super(Scene, self).__init__(name=name)
         self.index = len(Scene.instances)
-        Scene.instances.append(self)
+        Scene.instances.append(self) # add itself to instances.
         anim = None
         if not ExportSettings.anim == AnimOptions.NONE:
             anim = Animation('defaultAnimation')
-        self.nodes = []
+        self.nodes = [] # maya_nodes are pass to this lists
+
+        root_nodes = maya.cmds.ls(assemblies=True, long=True) # nodes without parent in scene
+
         if maya_nodes:
-            self.maya_nodes = maya_nodes
+            self.maya_nodes = [ node for node in maya_nodes if node in root_nodes]
         else:
-            self.maya_nodes = maya.cmds.ls(assemblies=True, long=True)
+            self.maya_nodes = root_nodes
+
         for transform in self.maya_nodes:
             if transform not in Camera.default_cameras:
                 self.nodes.append(Node(transform, anim))
@@ -285,7 +313,7 @@ class Node(ExportItem):
                     else:
                         cam = PerspectiveCamera(child)
                     self.camera = cam
-                elif childType == 'transform':
+                elif childType == 'transform' or childType == 'joint':
                     node = Node(child, anim)
                     self.children.append(node)
     
@@ -327,6 +355,8 @@ class Node(ExportItem):
     
     def to_json(self):
         node_def = {}
+        if self.name:
+            node_def['name'] = self.name
         if self.matrix:
             node_def['matrix'] = self.matrix
         if self.translation:
