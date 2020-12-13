@@ -10,6 +10,7 @@ import logging
 
 import maya.cmds
 import maya.OpenMaya as OpenMaya
+import maya.api.OpenMaya as om2
 try:
     from PySide.QtGui import QImage, QColor, qRed, qGreen, qBlue, QImageWriter
 except ImportError:
@@ -248,7 +249,10 @@ class Scene(ExportItem):
     def set_defaults(cls):
         cls.instances = []
     
-    def __init__(self, name="defaultScene", maya_nodes=None):
+    def __init__(self, name=None, maya_nodes=None):
+        name = maya.cmds.file(query=True, sceneName=True)
+        if not name:
+            raise Exception("You must save your scene before export.")
         super(Scene, self).__init__(name=name)
         self.index = len(Scene.instances)
         Scene.instances.append(self) # add itself to instances.
@@ -290,14 +294,17 @@ class Node(ExportItem):
     
     def __init__(self, maya_node, anim=None):
         self.maya_node = maya_node
-        name = maya.cmds.ls(maya_node, shortNames=True)[0]
+        name = self._get_node_name()
         super(Node, self).__init__(name=name)
         self.index = len(Node.instances)
         Node.instances.append(self)
         self.children = []
-        self.translation = maya.cmds.getAttr(self.maya_node+'.translate')[0]
+        # self.matrix = self._get_matrix()
+        # self.translation = maya.cmds.getAttr(self.maya_node + '.translate')[0]
+        self.translation = self._get_translation()
         self.rotation = self._get_rotation_quaternion()
-        self.scale = maya.cmds.getAttr(self.maya_node+'.scale')[0]
+        self.scale = self._get_scale()
+        # self.scale = maya.cmds.getAttr(self.maya_node + '.scale')[0]
         if anim:
             self._get_animation(anim)
         maya_children = maya.cmds.listRelatives(self.maya_node, children=True, fullPath=True)
@@ -305,6 +312,12 @@ class Node(ExportItem):
             for child in maya_children:
                 childType = maya.cmds.objectType(child)
                 if childType == 'mesh' and not maya.cmds.getAttr(child + ".intermediateObject"):
+                    # this is done to avoid include proxy meshes linked to joints
+                    grandParent = maya.cmds.listRelatives(maya_node, parent=True)
+
+                    if grandParent and maya.cmds.objectType(grandParent) == "joint"  :
+                        logger.info("meshes linked to joints are skipped")
+                        continue
                     mesh = Mesh(child)
                     self.mesh = mesh 
                 elif childType == 'camera':
@@ -313,10 +326,19 @@ class Node(ExportItem):
                     else:
                         cam = PerspectiveCamera(child)
                     self.camera = cam
-                elif childType == 'transform' or childType == 'joint':
+                elif childType == 'transform':
                     node = Node(child, anim)
                     self.children.append(node)
-    
+                elif childType == 'joint':
+                    node = Node(child, anim)
+                    self.children.append(node)
+
+    def _get_node_name(self, namespace=False):
+        name = maya.cmds.ls(self.maya_node, shortNames=True)[0]
+        if ":" in name: # strip namespace from name if found
+            name = name.split(":")[-1]
+        return name
+
     def _get_animation(self, anim):
         if maya.cmds.keyframe(self.maya_node, attribute='translate', query=True, keyframeCount=True):
             translation_channel = AnimationChannel(self, 'translation')
@@ -330,7 +352,44 @@ class Node(ExportItem):
             scale_channel = AnimationChannel(self, 'scale')
             anim.add_channel(scale_channel)
             anim.add_sampler(scale_channel.sampler)
-        
+
+    def _get_m_object(self):
+        obj=om2.MObject()
+        #make a object of type MSelectionList
+        sel_list=om2.MSelectionList()
+        #add something to it
+        #you could retrieve this from function or the user selection
+        sel_list.add(self.maya_node)
+        #fill in the MObject
+        return sel_list.getDependNode(0)
+
+    def _get_scale(self):
+        obj = self._get_m_object()
+        #check if its a transform
+        if (obj.hasFn(om2.MFn.kTransform)):
+            xform=om2.MFnTransform(obj)
+            return [each for each in xform.scale()]
+
+    def _get_translation(self):
+        obj = self._get_m_object()
+        #check if its a transform
+        if (obj.hasFn(om2.MFn.kTransform)):
+            xform=om2.MFnTransform(obj)
+            return [each for each in xform.translation(om2.MSpace.kTransform)] # int 1 
+
+    def _get_matrix(self):
+        #make a object of type MSelectionList
+        sel_list=om2.MSelectionList()
+        #add something to it
+        #you could retrieve this from function or the user selection
+        sel_list.add(self.maya_node)
+        dagPath = sel_list.getDagPath(0)
+        #check if its a transform
+        if (obj.hasFn(om2.MFn.kTransform)):
+            exclusive_matrix = dagPath.exclusiveMatrix()
+            rowMajorMatrix = exclusive_matrix.transpose()
+            return [each for each in rowMajorMatrix]
+
     def _get_rotation_quaternion(self):
         obj=OpenMaya.MObject()
         #make a object of type MSelectionList
@@ -342,16 +401,20 @@ class Node(ExportItem):
         sel_list.getDependNode(0,obj)
         #check if its a transform
         if (obj.hasFn(OpenMaya.MFn.kTransform)):
-            quat = OpenMaya.MQuaternion()
-            #then we can add it to transfrom Fn
-            #Fn is basically the collection of functions for given objects
+            quat_rotation = OpenMaya.MQuaternion()
             xform=OpenMaya.MFnTransform(obj)
-            xform.getRotation(quat)
-            # glTF requires normalize quat
-            quat.normalizeIt()
-        
-        py_quat = [quat[x] for x in range(4)]
-        return py_quat       
+            xform.getRotation(quat_rotation)
+
+            if (obj.hasFn(OpenMaya.MFn.kJoint)):
+                joint_orient = OpenMaya.MQuaternion()
+                joint = maya.OpenMayaAnim.MFnIkJoint(obj)   
+                rotation_orientation = xform.rotateOrientation(OpenMaya.MSpace.kTransform)
+                joint.getOrientation(joint_orient)
+                quat_rotation = rotation_orientation * quat_rotation * joint_orient
+            
+            quat_rotation.normalizeIt()
+
+        return [quat_rotation[x] for x in range(4)]     
     
     def to_json(self):
         node_def = {}
@@ -396,6 +459,7 @@ class Mesh(ExportItem):
         Mesh.instances.append(self)
         
         self._getMeshData()
+        self._getSkinCluster()
         self._getMaterial()
         
     def to_json(self):
@@ -418,6 +482,13 @@ class Mesh(ExportItem):
         # TODO: support facegroups as glTF primitivies to support one material per facegroup
         shader = maya.cmds.ls(maya.cmds.listConnections(shadingGrps),materials=True)[0]
         self.material = Material(shader)
+
+    @timeit
+    def _getSkinCluster(self):
+        logger.info("Searching for skin in {}".format(self.name))
+        skin_cluster = maya.mel.eval('findRelatedSkinCluster  {0}'.format(self.name))
+        if skin_cluster:
+            self.skin = Skin(skin_cluster)
     
     @timeit
     def _getMeshData(self):
@@ -447,9 +518,14 @@ class Mesh(ExportItem):
         face_verts = OpenMaya.MIntArray()
         polyNormals = OpenMaya.MFloatVectorArray()
         meshFn.getNormals(polyNormals)
+        uvs_count = meshFn.numUVs()
+        if uvs_count == 0:
+            logger.critical("numUVs: {}. {} has no uvs".format(uvs_count, self.maya_node))
+            raise Exception()
         uv_util = OpenMaya.MScriptUtil()
         uv_util.createFromList([0,0], 2 )
         uv_ptr = uv_util.asFloat2Ptr()
+
         while not meshIt.isDone():
             meshIt.getTriangles(points, ids)  
             meshIt.getVertices(face_verts)
@@ -461,6 +537,7 @@ class Mesh(ExportItem):
                 norm_id = meshIt.normalIndex(face_vert_id)
                 norm = polyNormals[norm_id]
                 norm = (norm.x, norm.y, norm.z)
+                uvSetName = meshFn.currentUVSetName()
                 meshIt.getUV(face_vert_id, uv_ptr, meshFn.currentUVSetName())
                 u = uv_util.getFloat2ArrayItem( uv_ptr, 0, 0 )
                 v = uv_util.getFloat2ArrayItem( uv_ptr, 0, 1 )
@@ -487,7 +564,7 @@ class Mesh(ExportItem):
                     color = vertexColorList[vertex_index]
                     colors[vertex_index] = (color.r, color.g, color.b)   
             meshIt.next()
-
+        
         if not len(Buffer.instances):
             primary_buffer = Buffer('primary_buffer')
         else:
@@ -506,7 +583,11 @@ class Mesh(ExportItem):
         self.normal_accessor = Accessor(normals, "VEC3", ComponentTypes.FLOAT, 34962, primary_buffer, name=self.name + '_norm')
         self.texcoord0_accessor = Accessor(uvs, "VEC2", ComponentTypes.FLOAT, 34962, primary_buffer, name=self.name + '_uv')
 
-        
+class Skin(ExportItem):
+    def __init__(self, skin_cluster): # not sure if needed
+        influences = maya.cmds.skinCluster(skin_cluster, query=True,inf=True)
+        logger.info("influences for {0}: {1}".format(skin_cluster, influences))
+
 
 class Material(ExportItem):
     '''Needs to add itself to materials and meshes list'''
